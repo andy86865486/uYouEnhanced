@@ -13,10 +13,6 @@ on:
         required: true
         default: "3.0.4"
         type: string
-      decrypted_youtube_url:
-        description: "Direct download URL for your decrypted YouTube IPA"
-        required: true
-        type: string
       ytuhd:
         description: "Include YTUHD"
         required: true
@@ -46,11 +42,6 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: Hide the IPA URL from logs
-        uses: levibostian/action-hide-sensitive-inputs@v1
-        with:
-          exclude_inputs: sdk_version,uyou_version,ytuhd,sponsorblock,create_release
-
       - name: Checkout uYouEnhanced
         uses: actions/checkout@v7
         with:
@@ -58,7 +49,7 @@ jobs:
           submodules: recursive
 
       - name: Install build dependencies
-        run: brew install ldid dpkg make wget unzip jq
+        run: brew install ldid dpkg make
 
       - name: Configure Theos
         run: |
@@ -90,7 +81,7 @@ jobs:
           mkdir -p "$THEOS/sdks"
           mv *.sdk "$THEOS/sdks/"
 
-      - name: Install Theos Jailed
+      - name: Install Theos Jailed module
         uses: actions/checkout@v7
         with:
           repository: qnblackcat/theos-jailed
@@ -115,58 +106,48 @@ jobs:
             fi
           done
 
-      - name: Download and prepare decrypted YouTube IPA
-        env:
-          IPA_URL: ${{ inputs.decrypted_youtube_url }}
-        run: |
-          set -euo pipefail
-          wget "$IPA_URL" --quiet -O main/YouTube.ipa
-          kind=$(file --mime-type -b main/YouTube.ipa)
-          if [[ "$kind" != "application/x-ios-app" && "$kind" != "application/zip" ]]; then
-            echo "Downloaded file is not an IPA: $kind" >&2
-            exit 1
-          fi
-          cd main
-          unzip -q YouTube.ipa
-          test -d Payload/YouTube.app
-          mkdir -p baseline
-          ditto Payload/YouTube.app baseline/YouTube.app
-
-      - name: Build uYouEnhanced without RootHide paths
+      - name: Build uYouEnhanced and its subprojects
         working-directory: main
         env:
           THEOS: ${{ github.workspace }}/theos
           UYOU_VERSION: ${{ inputs.uyou_version }}
         run: |
           set -euo pipefail
-          make package \
-            IPA=Payload/YouTube.app \
-            SDK_VERSION='${{ inputs.sdk_version }}' \
+          make all \
             FINALPACKAGE=1 \
+            SDK_VERSION='${{ inputs.sdk_version }}' \
             YTUHD_ENABLED=${{ inputs.ytuhd && '1' || '0' }} \
             SPONSORBLOCK_ENABLED=${{ inputs.sponsorblock && '1' || '0' }}
-          test -n "$(find packages -maxdepth 1 -type f -name '*.ipa' -print -quit)"
 
-      - name: Collect TrollFools plugins
+      - name: Package TrollFools ZIP
+        id: package
         working-directory: main
         run: |
           set -euo pipefail
-          built_ipa=$(find packages -maxdepth 1 -type f -name '*.ipa' -print -quit)
-          mkdir -p trollfools-built
-          unzip -q "$built_ipa" -d trollfools-built
-          test -d trollfools-built/Payload/YouTube.app
+          objdirs=()
+          while IFS= read -r -d '' objdir; do
+            objdirs+=("$objdir")
+          done < <(find . -type d -name obj \
+            -not -path './.git/*' \
+            -not -path './theos/*' \
+            -print0)
+          if [ "${#objdirs[@]}" -eq 0 ]; then
+            echo 'No Theos build output directories were found.' >&2
+            exit 1
+          fi
+          output="uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip"
           python3 Scripts/package_trollfools.py \
-            --built-app "$PWD/trollfools-built/Payload/YouTube.app" \
-            --baseline-app "$PWD/baseline/YouTube.app" \
-            --debs "$PWD/packages" \
-            --output "$PWD/uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip"
+            --roots "${objdirs[@]}" \
+            Bundles Localizations/uYouPlus.bundle Tweaks/uYou \
+            --output "$output"
+          echo "output=$output" >> "$GITHUB_OUTPUT"
 
       - name: Check plugin dependencies
         working-directory: main
         run: |
           set -euo pipefail
           mkdir -p dependency-check
-          unzip -q "uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip" -d dependency-check
+          unzip -q "${{ steps.package.outputs.output }}" -d dependency-check
           : > dependencies.txt
           while IFS= read -r -d '' binary; do
             if file "$binary" | grep -q 'Mach-O'; then
@@ -183,7 +164,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: uYouEnhanced-TrollFools
-          path: main/uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip
+          path: main/${{ steps.package.outputs.output }}
           if-no-files-found: error
           retention-days: 14
 
@@ -193,5 +174,5 @@ jobs:
         with:
           tag_name: uyou-trollfools-${{ github.run_number }}
           name: uYouEnhanced TrollFools ${{ inputs.uyou_version }} (${{ github.run_number }})
-          files: main/uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip
+          files: main/${{ steps.package.outputs.output }}
           draft: true
