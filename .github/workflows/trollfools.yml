@@ -51,6 +51,10 @@ jobs:
       - name: Install build dependencies
         run: brew install ldid dpkg make
 
+      - name: Install YTUHD build dependencies
+        if: ${{ inputs.ytuhd }}
+        run: brew install meson ninja
+
       - name: Configure Theos
         run: |
           echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
@@ -117,6 +121,18 @@ jobs:
               sed -i '' 's/| head/2>\/dev\/null | head/g' "$makefile" 2>/dev/null || true
             fi
           done
+
+      - name: Initialize and build YTUHD codec libraries
+        if: ${{ inputs.ytuhd }}
+        working-directory: main/Tweaks/YTUHD
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          test -f vendor/libvpx/vpx/vpx_decoder.h
+          test -f vendor/dav1d/include/dav1d/dav1d.h
+          make libvpx
+          make dav1d
 
       - name: Build uYouEnhanced and its subprojects
         working-directory: main
