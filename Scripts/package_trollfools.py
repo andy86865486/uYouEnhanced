@@ -40,6 +40,7 @@ def plugin_paths(root: Path):
             path.is_file()
             and path.name.endswith(".dylib")
             and "install" not in relative_parts
+            and len(relative_parts) == 1
         ):
             yield path
 
