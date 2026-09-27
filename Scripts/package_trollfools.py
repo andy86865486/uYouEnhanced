@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Collect uYouEnhanced and its tweak dependencies for TrollFools."""
+"""Collect compiled uYouEnhanced plugins and resources for TrollFools."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import shutil
-import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
+
 
 def digest(path: Path) -> str:
     hasher = hashlib.sha256()
@@ -28,6 +28,8 @@ def digest(path: Path) -> str:
 
 
 def plugin_paths(root: Path):
+    if not root.exists():
+        return
     for path in sorted(root.rglob("*")):
         if any(parent.name.endswith((".bundle", ".framework")) for parent in path.parents if parent != root):
             continue
@@ -37,68 +39,40 @@ def plugin_paths(root: Path):
             yield path
 
 
-def add_plugin(source: Path, stage: Path, added: set[str]) -> None:
-    target = stage / source.name
-    if target.exists():
-        if digest(source) != digest(target):
-            raise RuntimeError(f"Conflicting plugin with the same name: {source.name}")
-        return
-    if source.is_dir():
-        shutil.copytree(source, target, symlinks=True)
-    else:
-        shutil.copy2(source, target)
-    added.add(source.name)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--built-app", type=Path, required=True)
-    parser.add_argument("--baseline-app", type=Path, required=True)
-    parser.add_argument("--debs", type=Path, required=True)
+    parser.add_argument("--roots", type=Path, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-
-    if not args.built_app.is_dir() or not args.baseline_app.is_dir():
-        raise SystemExit("Built and baseline YouTube.app directories are required")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     added: set[str] = set()
     with tempfile.TemporaryDirectory(prefix="uyou-trollfools-") as temp:
-        temp_path = Path(temp)
-        stage = temp_path / "plugins"
+        stage = Path(temp) / "plugins"
         stage.mkdir()
 
-        # The IPA build adds the primary uYouEnhanced injection files.
-        for item in plugin_paths(args.built_app):
-            relative = item.relative_to(args.built_app)
-            original = args.baseline_app / relative
-            if original.exists() and digest(item) == digest(original):
-                continue
-            add_plugin(item, stage, added)
-
-        # Subproject tweak packages carry the other dylibs, bundles, and frameworks.
-        debs = sorted(args.debs.glob("*.deb"))
-        if not debs:
-            raise SystemExit("No subproject .deb files were produced by the build")
-        for index, deb in enumerate(debs):
-            extracted = temp_path / f"deb-{index}"
-            extracted.mkdir()
-            subprocess.run(["dpkg-deb", "-x", str(deb), str(extracted)], check=True)
-            for item in plugin_paths(extracted):
-                add_plugin(item, stage, added)
+        for root in args.roots:
+            for source in plugin_paths(root):
+                target = stage / source.name
+                if target.exists():
+                    if digest(source) != digest(target):
+                        raise SystemExit(f"Conflicting plugin with the same name: {source.name}")
+                    continue
+                if source.is_dir():
+                    shutil.copytree(source, target, symlinks=True)
+                else:
+                    shutil.copy2(source, target)
+                added.add(source.name)
 
         if not any(name.endswith(".dylib") for name in added):
-            raise SystemExit("No tweak dylibs were found in the build output")
+            raise SystemExit("No compiled tweak dylibs were found in the build output")
 
         with zipfile.ZipFile(args.output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for item in sorted(stage.iterdir()):
                 if item.is_dir():
-                    for child in sorted(item.rglob("*")):
-                        if child.is_file():
-                            archive.write(child, child.relative_to(stage).as_posix())
-                        elif child.is_dir():
-                            archive.write(child, child.relative_to(stage).as_posix() + "/")
                     archive.write(item, item.name + "/")
+                    for child in sorted(item.rglob("*")):
+                        archive.write(child, child.relative_to(stage).as_posix())
                 else:
                     archive.write(item, item.name)
 
