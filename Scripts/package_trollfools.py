@@ -31,11 +31,16 @@ def plugin_paths(root: Path):
     if not root.exists():
         return
     for path in sorted(root.rglob("*")):
+        relative_parts = path.relative_to(root).parts
         if any(parent.name.endswith((".bundle", ".framework")) for parent in path.parents if parent != root):
             continue
         if path.is_dir() and path.name.endswith((".bundle", ".framework")):
             yield path
-        elif path.is_file() and path.name.endswith(".dylib"):
+        elif (
+            path.is_file()
+            and path.name.endswith(".dylib")
+            and "install" not in relative_parts
+        ):
             yield path
 
 
@@ -47,6 +52,7 @@ def main() -> None:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     added: set[str] = set()
+    origins: dict[str, Path] = {}
     with tempfile.TemporaryDirectory(prefix="uyou-trollfools-") as temp:
         stage = Path(temp) / "plugins"
         stage.mkdir()
@@ -56,13 +62,18 @@ def main() -> None:
                 target = stage / source.name
                 if target.exists():
                     if digest(source) != digest(target):
-                        raise SystemExit(f"Conflicting plugin with the same name: {source.name}")
+                        raise SystemExit(
+                            f"Conflicting plugin with the same name: {source.name}\n"
+                            f"  existing: {origins[source.name]}\n"
+                            f"  incoming: {source}"
+                        )
                     continue
                 if source.is_dir():
                     shutil.copytree(source, target, symlinks=True)
                 else:
                     shutil.copy2(source, target)
                 added.add(source.name)
+                origins[source.name] = source
 
         if not any(name.endswith(".dylib") for name in added):
             raise SystemExit("No compiled tweak dylibs were found in the build output")
