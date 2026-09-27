@@ -78,8 +78,20 @@ jobs:
           cd sdks
           git sparse-checkout set --no-cone "iPhoneOS${{ inputs.sdk_version }}.sdk"
           git checkout --quiet
+          set -euo pipefail
+          git clone --quiet --depth=1 --filter=blob:none --sparse \
+            https://github.com/xybp888/iOS-SDKs.git sdks
+          git -C sdks sparse-checkout set "iPhoneOS${{ inputs.sdk_version }}.sdk"
+          sdk_path="sdks/iPhoneOS${{ inputs.sdk_version }}.sdk"
+          if [ ! -d "$sdk_path" ]; then
+            echo "Requested SDK was not found: $sdk_path" >&2
+            echo 'Available SDK folders:' >&2
+            git -C sdks ls-tree --name-only HEAD 'iPhoneOS*.sdk' >&2
+            exit 1
+          fi
           mkdir -p "$THEOS/sdks"
           mv *.sdk "$THEOS/sdks/"
+          cp -R "$sdk_path" "$THEOS/sdks/"
 
       - name: Install Theos Jailed module
         uses: actions/checkout@v7
