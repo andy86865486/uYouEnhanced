@@ -1,206 +1,96 @@
-name: Generate TrollFools files
+#!/usr/bin/env python3
+"""Collect compiled uYouEnhanced plugins and resources for TrollFools."""
 
-on:
-  workflow_dispatch:
-    inputs:
-      sdk_version:
-        description: "iOS SDK version"
-        required: true
-        default: "18.6"
-        type: string
-      uyou_version:
-        description: "uYou version"
-        required: true
-        default: "3.0.4"
-        type: string
-      ytuhd:
-        description: "Include YTUHD"
-        required: true
-        default: false
-        type: boolean
-      sponsorblock:
-        description: "Include iSponsorBlock"
-        required: true
-        default: false
-        type: boolean
-      create_release:
-        description: "Create a draft release with a direct ZIP download"
-        required: true
-        default: true
-        type: boolean
+from __future__ import annotations
 
-permissions:
-  contents: write
+import argparse
+import hashlib
+import shutil
+import tempfile
+import zipfile
+from pathlib import Path
 
-concurrency:
-  group: trollfools-${{ github.ref }}
-  cancel-in-progress: true
 
-jobs:
-  build:
-    name: Build uYouEnhanced for TrollFools
-    runs-on: macos-latest
+def digest(path: Path) -> str:
+    hasher = hashlib.sha256()
+    if path.is_file():
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(chunk)
+    else:
+        for child in sorted(path.rglob("*")):
+            if child.is_file():
+                hasher.update(child.relative_to(path).as_posix().encode())
+                with child.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+    return hasher.hexdigest()
 
-    steps:
-      - name: Checkout uYouEnhanced
-        uses: actions/checkout@v7
-        with:
-          path: main
-          submodules: recursive
 
-      - name: Install build dependencies
-        run: brew install ldid dpkg make
+def plugin_paths(root: Path):
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*")):
+        relative_parts = path.relative_to(root).parts
+        if any(parent.name.endswith((".bundle", ".framework")) for parent in path.parents if parent != root):
+            continue
+        if path.is_dir() and path.name.endswith((".bundle", ".framework")):
+            yield path
+        elif (
+            path.is_file()
+            and path.name.endswith(".dylib")
+            and "install" not in relative_parts
+        ):
+            yield path
 
-      - name: Install YTUHD build dependencies
-        if: ${{ inputs.ytuhd }}
-        run: brew install meson ninja
 
-      - name: Configure Theos
-        run: |
-          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
-          echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--roots", type=Path, nargs="+", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
 
-      - name: Install Theos
-        uses: actions/checkout@v7
-        with:
-          repository: theos/theos
-          ref: master
-          path: theos
-          submodules: recursive
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    added: set[str] = set()
+    origins: dict[str, Path] = {}
+    with tempfile.TemporaryDirectory(prefix="uyou-trollfools-") as temp:
+        stage = Path(temp) / "plugins"
+        stage.mkdir()
 
-      - name: Cache iOS SDK
-        id: sdk
-        uses: actions/cache@v6
-        with:
-          path: theos/sdks/
-          key: iOS-${{ inputs.sdk_version }}-SDK
+        for root in args.roots:
+            for source in plugin_paths(root):
+                target = stage / source.name
+                if target.exists():
+                    if digest(source) != digest(target):
+                        raise SystemExit(
+                            f"Conflicting plugin with the same name: {source.name}\n"
+                            f"  existing: {origins[source.name]}\n"
+                            f"  incoming: {source}"
+                        )
+                    continue
+                if source.is_dir():
+                    shutil.copytree(source, target, symlinks=True)
+                else:
+                    shutil.copy2(source, target)
+                added.add(source.name)
+                origins[source.name] = source
 
-      - name: Download iOS SDK
-        if: steps.sdk.outputs.cache-hit != 'true'
-        run: |
-          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/aricloverALT/sdks/ sdks
-          cd sdks
-          git sparse-checkout set --no-cone "iPhoneOS${{ inputs.sdk_version }}.sdk"
-          git checkout --quiet
-          set -euo pipefail
-          git clone --quiet --depth=1 --filter=blob:none --sparse \
-            https://github.com/xybp888/iOS-SDKs.git sdks
-          git -C sdks sparse-checkout set "iPhoneOS${{ inputs.sdk_version }}.sdk"
-          sdk_path="sdks/iPhoneOS${{ inputs.sdk_version }}.sdk"
-          if [ ! -d "$sdk_path" ]; then
-            echo "Requested SDK was not found: $sdk_path" >&2
-            echo 'Available SDK folders:' >&2
-            git -C sdks ls-tree --name-only HEAD 'iPhoneOS*.sdk' >&2
-            exit 1
-          fi
-          mkdir -p "$THEOS/sdks"
-          mv *.sdk "$THEOS/sdks/"
-          cp -R "$sdk_path" "$THEOS/sdks/"
+        if not any(name.endswith(".dylib") for name in added):
+            raise SystemExit("No compiled tweak dylibs were found in the build output")
 
-      - name: Install Theos Jailed module
-        uses: actions/checkout@v7
-        with:
-          repository: qnblackcat/theos-jailed
-          ref: master
-          path: theos-jailed
+        with zipfile.ZipFile(args.output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for item in sorted(stage.iterdir()):
+                if item.is_dir():
+                    archive.write(item, item.name + "/")
+                    for child in sorted(item.rglob("*")):
+                        archive.write(child, child.relative_to(stage).as_posix())
+                else:
+                    archive.write(item, item.name)
 
-      - name: Set up Theos Jailed
-        run: ./theos-jailed/install
-        env:
-          THEOS: ${{ github.workspace }}/theos
+    print(f"Created {args.output} with {len(added)} top-level plugins:")
+    for name in sorted(added):
+        print(f"  {name}")
 
-      - name: Patch Theos broken-pipe scripts
-        run: |
-          find "$THEOS" -name '*.sh' -type f | while read -r script; do
-            if grep -q '| head' "$script" 2>/dev/null; then
-              sed -i '' 's/| head/2>\/dev\/null | head/g' "$script" 2>/dev/null || true
-            fi
-          done
-          find "$THEOS" -name '*.mk' -type f | while read -r makefile; do
-            if grep -q '| head' "$makefile" 2>/dev/null; then
-              sed -i '' 's/| head/2>\/dev\/null | head/g' "$makefile" 2>/dev/null || true
-            fi
-          done
 
-      - name: Initialize and build YTUHD codec libraries
-        if: ${{ inputs.ytuhd }}
-        working-directory: main/Tweaks/YTUHD
-        run: |
-          set -euo pipefail
-          git submodule sync --recursive
-          git submodule update --init --recursive
-          test -f vendor/libvpx/vpx/vpx_decoder.h
-          test -f vendor/dav1d/include/dav1d/dav1d.h
-          make libvpx
-          make dav1d
-
-      - name: Build uYouEnhanced and its subprojects
-        working-directory: main
-        env:
-          THEOS: ${{ github.workspace }}/theos
-          UYOU_VERSION: ${{ inputs.uyou_version }}
-        run: |
-          set -euo pipefail
-          make all \
-            FINALPACKAGE=1 \
-            SDK_VERSION='${{ inputs.sdk_version }}' \
-            YTUHD_ENABLED=${{ inputs.ytuhd && '1' || '0' }} \
-            SPONSORBLOCK_ENABLED=${{ inputs.sponsorblock && '1' || '0' }}
-
-      - name: Package TrollFools ZIP
-        id: package
-        working-directory: main
-        run: |
-          set -euo pipefail
-          objdirs=()
-          while IFS= read -r -d '' objdir; do
-            objdirs+=("$objdir")
-          done < <(find . -type d -name obj \
-            -not -path './.git/*' \
-            -not -path './theos/*' \
-            -print0)
-          if [ "${#objdirs[@]}" -eq 0 ]; then
-            echo 'No Theos build output directories were found.' >&2
-            exit 1
-          fi
-          output="uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip"
-          python3 Scripts/package_trollfools.py \
-            --roots "${objdirs[@]}" \
-            Bundles Localizations/uYouPlus.bundle Tweaks/uYou \
-            --output "$output"
-          echo "output=$output" >> "$GITHUB_OUTPUT"
-
-      - name: Check plugin dependencies
-        working-directory: main
-        run: |
-          set -euo pipefail
-          mkdir -p dependency-check
-          unzip -q "${{ steps.package.outputs.output }}" -d dependency-check
-          : > dependencies.txt
-          while IFS= read -r -d '' binary; do
-            if file "$binary" | grep -q 'Mach-O'; then
-              otool -L "$binary" >> dependencies.txt
-            fi
-          done < <(find dependency-check -type f -print0)
-          cat dependencies.txt
-          if grep -Eq '\.jbroot|/var/jb|libroothide' dependencies.txt; then
-            echo 'Jailbreak-bootstrap dependency detected in a plugin binary.' >&2
-            exit 1
-          fi
-
-      - name: Upload TrollFools ZIP artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: uYouEnhanced-TrollFools
-          path: main/${{ steps.package.outputs.output }}
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Create draft release
-        if: ${{ inputs.create_release }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: uyou-trollfools-${{ github.run_number }}
-          name: uYouEnhanced TrollFools ${{ inputs.uyou_version }} (${{ github.run_number }})
-          files: main/${{ steps.package.outputs.output }}
-          draft: true
+if __name__ == "__main__":
+    main()
