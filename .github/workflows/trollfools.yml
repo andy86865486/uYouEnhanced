@@ -1,0 +1,197 @@
+name: Generate TrollFools files
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_version:
+        description: "iOS SDK version"
+        required: true
+        default: "18.6"
+        type: string
+      uyou_version:
+        description: "uYou version"
+        required: true
+        default: "3.0.4"
+        type: string
+      decrypted_youtube_url:
+        description: "Direct download URL for your decrypted YouTube IPA"
+        required: true
+        type: string
+      ytuhd:
+        description: "Include YTUHD"
+        required: true
+        default: false
+        type: boolean
+      sponsorblock:
+        description: "Include iSponsorBlock"
+        required: true
+        default: false
+        type: boolean
+      create_release:
+        description: "Create a draft release with a direct ZIP download"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trollfools-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build uYouEnhanced for TrollFools
+    runs-on: macos-latest
+
+    steps:
+      - name: Hide the IPA URL from logs
+        uses: levibostian/action-hide-sensitive-inputs@v1
+        with:
+          exclude_inputs: sdk_version,uyou_version,ytuhd,sponsorblock,create_release
+
+      - name: Checkout uYouEnhanced
+        uses: actions/checkout@v7
+        with:
+          path: main
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: brew install ldid dpkg make wget unzip jq
+
+      - name: Configure Theos
+        run: |
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
+
+      - name: Install Theos
+        uses: actions/checkout@v7
+        with:
+          repository: theos/theos
+          ref: master
+          path: theos
+          submodules: recursive
+
+      - name: Cache iOS SDK
+        id: sdk
+        uses: actions/cache@v6
+        with:
+          path: theos/sdks/
+          key: iOS-${{ inputs.sdk_version }}-SDK
+
+      - name: Download iOS SDK
+        if: steps.sdk.outputs.cache-hit != 'true'
+        run: |
+          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/aricloverALT/sdks/ sdks
+          cd sdks
+          git sparse-checkout set --no-cone "iPhoneOS${{ inputs.sdk_version }}.sdk"
+          git checkout --quiet
+          mkdir -p "$THEOS/sdks"
+          mv *.sdk "$THEOS/sdks/"
+
+      - name: Install Theos Jailed
+        uses: actions/checkout@v7
+        with:
+          repository: qnblackcat/theos-jailed
+          ref: master
+          path: theos-jailed
+
+      - name: Set up Theos Jailed
+        run: ./theos-jailed/install
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Patch Theos broken-pipe scripts
+        run: |
+          find "$THEOS" -name '*.sh' -type f | while read -r script; do
+            if grep -q '| head' "$script" 2>/dev/null; then
+              sed -i '' 's/| head/2>\/dev\/null | head/g' "$script" 2>/dev/null || true
+            fi
+          done
+          find "$THEOS" -name '*.mk' -type f | while read -r makefile; do
+            if grep -q '| head' "$makefile" 2>/dev/null; then
+              sed -i '' 's/| head/2>\/dev\/null | head/g' "$makefile" 2>/dev/null || true
+            fi
+          done
+
+      - name: Download and prepare decrypted YouTube IPA
+        env:
+          IPA_URL: ${{ inputs.decrypted_youtube_url }}
+        run: |
+          set -euo pipefail
+          wget "$IPA_URL" --quiet -O main/YouTube.ipa
+          kind=$(file --mime-type -b main/YouTube.ipa)
+          if [[ "$kind" != "application/x-ios-app" && "$kind" != "application/zip" ]]; then
+            echo "Downloaded file is not an IPA: $kind" >&2
+            exit 1
+          fi
+          cd main
+          unzip -q YouTube.ipa
+          test -d Payload/YouTube.app
+          mkdir -p baseline
+          ditto Payload/YouTube.app baseline/YouTube.app
+
+      - name: Build uYouEnhanced without RootHide paths
+        working-directory: main
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          UYOU_VERSION: ${{ inputs.uyou_version }}
+        run: |
+          set -euo pipefail
+          make package \
+            IPA=Payload/YouTube.app \
+            SDK_VERSION='${{ inputs.sdk_version }}' \
+            FINALPACKAGE=1 \
+            YTUHD_ENABLED=${{ inputs.ytuhd && '1' || '0' }} \
+            SPONSORBLOCK_ENABLED=${{ inputs.sponsorblock && '1' || '0' }}
+          test -n "$(find packages -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+
+      - name: Collect TrollFools plugins
+        working-directory: main
+        run: |
+          set -euo pipefail
+          built_ipa=$(find packages -maxdepth 1 -type f -name '*.ipa' -print -quit)
+          mkdir -p trollfools-built
+          unzip -q "$built_ipa" -d trollfools-built
+          test -d trollfools-built/Payload/YouTube.app
+          python3 Scripts/package_trollfools.py \
+            --built-app "$PWD/trollfools-built/Payload/YouTube.app" \
+            --baseline-app "$PWD/baseline/YouTube.app" \
+            --debs "$PWD/packages" \
+            --output "$PWD/uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip"
+
+      - name: Check plugin dependencies
+        working-directory: main
+        run: |
+          set -euo pipefail
+          mkdir -p dependency-check
+          unzip -q "uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip" -d dependency-check
+          : > dependencies.txt
+          while IFS= read -r -d '' binary; do
+            if file "$binary" | grep -q 'Mach-O'; then
+              otool -L "$binary" >> dependencies.txt
+            fi
+          done < <(find dependency-check -type f -print0)
+          cat dependencies.txt
+          if grep -Eq '\.jbroot|/var/jb|libroothide' dependencies.txt; then
+            echo 'Jailbreak-bootstrap dependency detected in a plugin binary.' >&2
+            exit 1
+          fi
+
+      - name: Upload TrollFools ZIP artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: uYouEnhanced-TrollFools
+          path: main/uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create draft release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: uyou-trollfools-${{ github.run_number }}
+          name: uYouEnhanced TrollFools ${{ inputs.uyou_version }} (${{ github.run_number }})
+          files: main/uYouEnhanced_TrollFools_${{ inputs.uyou_version }}.zip
+          draft: true
